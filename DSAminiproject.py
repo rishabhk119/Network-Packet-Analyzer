@@ -1,328 +1,331 @@
-import random
+import socket
+import struct
+import threading
 import time
-import json
-from collections import deque
-from datetime import datetime
+import random
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+from tkinter import messagebox, filedialog
 
-class CircularBuffer:
-    """Circular Buffer for storing recent packets (DSA: Circular Buffer)"""
-    def __init__(self, capacity=1000):
-        self.capacity = capacity
-        self.buffer = [None] * capacity
-        self.head = 0
-        self.tail = 0
-        self.size = 0
-    
-    def add(self, packet):
-        """Add a packet to the buffer"""
-        self.buffer[self.tail] = packet
-        self.tail = (self.tail + 1) % self.capacity
-        
-        if self.size == self.capacity:
-            self.head = (self.head + 1) % self.capacity
+PACKET_BUFFER_SIZE = 50
+
+class PacketAnalyzerGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Network Packet Analyzer — Subtle Edition")
+        self.master.geometry("1000x650")
+        self.packet_buffer = []
+        self.stats_protocol = {'TCP': 0, 'UDP': 0, 'Other': 0}
+        self.stats_ports = {}
+        self.stats_ips = {}
+        self.running = False
+        self.paused = False
+        self.capture_thread = None
+        self.start_time = None
+        self.error_count = 0
+        self.packet_limit = PACKET_BUFFER_SIZE
+        self.demo_mode = True  # Default to demo
+
+        # Toolbar
+        toolbar = tb.Frame(self.master, style="light", padding=12)
+        toolbar.pack(fill="x", pady=(8,2))
+        self.start_button = tb.Button(toolbar, text="Start", width=11, bootstyle=SECONDARY, command=self.start_capture)
+        self.start_button.pack(side="left", padx=8)
+        self.stop_button = tb.Button(toolbar, text="Stop", width=11, bootstyle=LIGHT, command=self.stop_capture)
+        self.stop_button.pack(side="left", padx=8)
+        self.pause_button = tb.Button(toolbar, text="Pause", width=11, bootstyle=INFO, command=self.toggle_pause)
+        self.pause_button.pack(side="left", padx=8)
+        self.mode_button = tb.Button(toolbar, text="Demo Mode", width=12, bootstyle=PRIMARY, command=self.toggle_mode)
+        self.mode_button.pack(side="left", padx=16)
+        tb.Label(toolbar, text="Protocol:", bootstyle=LIGHT).pack(side="left", padx=(20,2))
+        self.protocol_filter = tb.StringVar(value="ALL")
+        self.protocol_select = tb.Combobox(toolbar, textvariable=self.protocol_filter, state="readonly", width=8, values=["ALL","TCP","UDP","Other"])
+        self.protocol_select.pack(side="left")
+        self.protocol_select.bind("<<ComboboxSelected>>", lambda _: self.refresh_table())
+        tb.Label(toolbar, text="Port:", bootstyle=LIGHT).pack(side="left", padx=8)
+        self.port_filter = tb.Entry(toolbar, width=8)
+        self.port_filter.pack(side="left")
+        self.port_filter.bind("<KeyRelease>", lambda _: self.refresh_table())
+        tb.Button(toolbar, text="Clear", width=10, bootstyle=WARNING, command=self.clear_display).pack(side="left", padx=12)
+        tb.Button(toolbar, text="Save CSV", width=10, bootstyle=LIGHT, command=self.save_to_csv).pack(side="right", padx=12)
+        tb.Button(toolbar, text="About", width=8, bootstyle=SECONDARY, command=self.show_about).pack(side="right", padx=11)
+
+        # Progress bar
+        self.progress = tb.Progressbar(self.master, maximum=PACKET_BUFFER_SIZE, style="info-striped")
+        self.progress.pack(fill="x", pady=(6,0), padx=33)
+        self.progress["value"] = 0
+
+        # Stats panel
+        stats_panel = tb.Frame(self.master, style="light", padding=9)
+        stats_panel.pack(fill="x", pady=(6,0))
+        self.stats_label = tb.Label(stats_panel, text="Packets: 0  TCP: 0  UDP: 0  Other: 0", bootstyle=INFO)
+        self.stats_label.pack(side="left", padx=14)
+        self.top_ip_label = tb.Label(stats_panel, text="Top IPs: -", bootstyle=LIGHT)
+        self.top_ip_label.pack(side="left", padx=16)
+        self.top_port_label = tb.Label(stats_panel, text="Top Ports: -", bootstyle=LIGHT)
+        self.top_port_label.pack(side="left", padx=16)
+        self.timer_label = tb.Label(stats_panel, text="00:00", bootstyle=INFO)
+        self.timer_label.pack(side="right", padx=18)
+
+        # Table panel
+        table_panel = tb.Frame(self.master, style="light")
+        table_panel.pack(fill="both", expand=True, padx=20, pady=14)
+        columns = ("idx","src","sport","dst","dport","proto")
+        self.packet_table = tb.Treeview(table_panel, columns=columns, show="headings", height=21, bootstyle="light")
+        self.packet_table.heading("idx", text="#")
+        self.packet_table.heading("src", text="Source IP")
+        self.packet_table.heading("sport", text="Src Port")
+        self.packet_table.heading("dst", text="Destination IP")
+        self.packet_table.heading("dport", text="Dst Port")
+        self.packet_table.heading("proto", text="Protocol")
+        self.packet_table.column("idx", width=55)
+        self.packet_table.column("src", width=145)
+        self.packet_table.column("sport", width=105)
+        self.packet_table.column("dst", width=145)
+        self.packet_table.column("dport", width=105)
+        self.packet_table.column("proto", width=110)
+        # Gentle row colors
+        self.packet_table.tag_configure('oddrow', background='#f9f9fc')
+        self.packet_table.tag_configure('evenrow', background='#f3f6f9')
+        self.packet_table.pack(fill="both", expand=True, pady=3)
+        self.packet_table.bind("<Double-1>", self.show_packet_details)
+
+        # Status bar
+        self.status_var = tb.StringVar(value="Ready.")
+        statusbar = tb.Label(self.master, textvariable=self.status_var, bootstyle=LIGHT, anchor="w", font=("Segoe UI", 10))
+        statusbar.pack(fill="x", side="bottom", pady=(0,2))
+
+        self.update_timer()
+        self.refresh_table()
+        self.update_stats_display()
+
+    def toggle_mode(self):
+        self.demo_mode = not self.demo_mode
+        if self.demo_mode:
+            self.mode_button.config(text="Demo Mode", bootstyle=PRIMARY)
+            self.status_var.set("Demo mode enabled, instant fast capture.")
         else:
-            self.size += 1
-    
-    def get_recent(self, count=10):
-        """Get most recent packets (DSA: Buffer traversal)"""
-        if count > self.size:
-            count = self.size
-        
-        result = []
-        current = (self.tail - 1) % self.capacity
-        
-        for _ in range(count):
-            if self.buffer[current] is not None:
-                result.append(self.buffer[current])
-            current = (current - 1) % self.capacity
-            if current == self.head:
-                break
-        
-        return result
-    
-    def __len__(self):
-        return self.size
+            self.mode_button.config(text="Live Mode", bootstyle=SECONDARY)
+            self.status_var.set("Live mode enabled, real packet capture (admin/root).")
 
-class ProtocolAnalyzer:
-    """Analyze protocols using Hash Tables (DSA: Hash Table)"""
-    def __init__(self):
-        self.protocol_count = {}
-        self.source_stats = {}
-        self.destination_stats = {}
-    
-    def add_packet(self, packet):
-        """Update protocol and address statistics"""
-        # Count protocols
-        protocol = packet.get('protocol', 'UNKNOWN')
-        self.protocol_count[protocol] = self.protocol_count.get(protocol, 0) + 1
-        
-        # Count source addresses
-        src = packet.get('source_ip', 'UNKNOWN')
-        if src not in self.source_stats:
-            self.source_stats[src] = {'count': 0, 'protocols': set()}
-        self.source_stats[src]['count'] += 1
-        self.source_stats[src]['protocols'].add(protocol)
-        
-        # Count destination addresses
-        dst = packet.get('destination_ip', 'UNKNOWN')
-        if dst not in self.destination_stats:
-            self.destination_stats[dst] = {'count': 0, 'protocols': set()}
-        self.destination_stats[dst]['count'] += 1
-        self.destination_stats[dst]['protocols'].add(protocol)
-    
-    def get_top_protocols(self, n=5):
-        """Get top N protocols by count"""
-        return sorted(self.protocol_count.items(), key=lambda x: x[1], reverse=True)[:n]
-    
-    def get_top_sources(self, n=5):
-        """Get top N source IPs"""
-        return sorted(self.source_stats.items(), key=lambda x: x[1]['count'], reverse=True)[:n]
-    
-    def get_top_destinations(self, n=5):
-        """Get top N destination IPs"""
-        return sorted(self.destination_stats.items(), key=lambda x: x[1]['count'], reverse=True)[:n]
-
-class PacketTree:
-    """Tree structure for organizing packets hierarchically (DSA: Tree)"""
-    class TreeNode:
-        def __init__(self, key, packet=None):
-            self.key = key
-            self.packets = []
-            self.children = {}
-            if packet:
-                self.packets.append(packet)
-    
-    def __init__(self):
-        self.root = self.TreeNode("root")
-    
-    def add_packet_by_hierarchy(self, packet, hierarchy_keys):
-        """Add packet to tree based on hierarchy (e.g., [protocol, source_ip])"""
-        current = self.root
-        
-        for key in hierarchy_keys:
-            hierarchy_value = packet.get(key, 'unknown')
-            if hierarchy_value not in current.children:
-                current.children[hierarchy_value] = self.TreeNode(hierarchy_value)
-            current = current.children[hierarchy_value]
-        
-        current.packets.append(packet)
-    
-    def print_tree(self, node=None, level=0):
-        """Print tree structure (DFS traversal)"""
-        if node is None:
-            node = self.root
-        
-        indent = "  " * level
-        print(f"{indent}└─ {node.key} ({len(node.packets)} packets)")
-        
-        for child in node.children.values():
-            self.print_tree(child, level + 1)
-
-class NetworkPacketAnalyzer:
-    """Main analyzer class integrating all DSA components"""
-    
-    def __init__(self, buffer_capacity=1000):
-        self.packet_buffer = CircularBuffer(buffer_capacity)
-        self.protocol_analyzer = ProtocolAnalyzer()
-        self.packet_tree = PacketTree()
-        self.packet_count = 0
-        self.start_time = datetime.now()
-        
-        # Common data for packet generation
-        self.protocols = ['TCP', 'UDP', 'HTTP', 'HTTPS', 'DNS', 'ICMP', 'SSH']
-        self.source_ips = [f'192.168.1.{i}' for i in range(1, 50)]
-        self.destination_ips = [
-            '8.8.8.8', '1.1.1.1', '151.101.1.69', '142.250.181.174',
-            '13.107.42.14', '104.16.249.249', '192.168.1.1'
-        ]
-        self.ports = [80, 443, 22, 53, 25, 110, 993, 995]
-    
-    def generate_sample_packet(self):
-        """Generate a sample network packet for simulation"""
-        protocol = random.choice(self.protocols)
-        source_ip = random.choice(self.source_ips)
-        dest_ip = random.choice(self.destination_ips)
-        
-        packet = {
-            'timestamp': datetime.now(),
-            'protocol': protocol,
-            'source_ip': source_ip,
-            'destination_ip': dest_ip,
-            'source_port': random.choice(self.ports),
-            'destination_port': random.choice(self.ports),
-            'packet_size': random.randint(64, 1500),
-            'flags': random.choice(['SYN', 'ACK', 'FIN', 'PSH', 'RST']),
-            'sequence_number': random.randint(1000, 9999),
-            'id': self.packet_count
+    def create_fake_packet(self):
+        protocols = ["TCP", "UDP", "Other"]
+        src_ip = f"192.168.1.{random.randint(1,254)}"
+        dst_ip = f"192.168.1.{random.randint(1,254)}"
+        proto = random.choice(protocols)
+        sport = random.randint(1000, 9000)
+        dport = random.randint(1000, 9000)
+        raw = b"FAKEPACKETDATA" + bytes(random.randint(0,255) for _ in range(45))
+        return {
+            "src": src_ip, "dst": dst_ip, "proto": proto,
+            "sport": sport, "dport": dport, "raw": raw
         }
-        
-        self.packet_count += 1
-        return packet
-    
-    def process_packet(self, packet):
-        """Process a single packet through all analyzers"""
-        # Add to circular buffer
-        self.packet_buffer.add(packet)
-        
-        # Update protocol statistics
-        self.protocol_analyzer.add_packet(packet)
-        
-        # Add to tree (organized by protocol -> source_ip)
-        self.packet_tree.add_packet_by_hierarchy(packet, ['protocol', 'source_ip'])
-    
-    def start_capture(self, duration=30, packet_rate=10):
-        """Start simulated packet capture"""
-        print(f"🚀 Starting packet capture for {duration} seconds...")
-        print(f"📦 Target rate: {packet_rate} packets/second")
-        print("-" * 60)
-        
-        end_time = time.time() + duration
-        packets_captured = 0
-        
-        try:
-            while time.time() < end_time:
-                # Generate and process packets
-                packets_this_second = random.randint(packet_rate//2, packet_rate*2)
-                
-                for _ in range(packets_this_second):
-                    packet = self.generate_sample_packet()
-                    self.process_packet(packet)
-                    packets_captured += 1
-                
-                # Display real-time stats every 2 seconds
-                if int(time.time()) % 2 == 0:
-                    self.display_realtime_stats(packets_captured)
-                
-                time.sleep(1)  # Simulate real-time capture
-                
-        except KeyboardInterrupt:
-            print("\n⏹️  Capture stopped by user")
-        
-        print("\n" + "="*60)
-        print("📊 CAPTURE COMPLETE - FINAL ANALYSIS")
-        print("="*60)
-        self.display_comprehensive_analysis()
-    
-    def display_realtime_stats(self, total_packets):
-        """Display real-time statistics"""
-        recent_packets = self.packet_buffer.get_recent(5)
-        
-        print(f"\n🕒 {datetime.now().strftime('%H:%M:%S')} | "
-              f"Total: {total_packets} packets | "
-              f"Buffer: {len(self.packet_buffer)}/{self.packet_buffer.capacity}")
-        
-        if recent_packets:
-            print("📨 Recent packets:")
-            for packet in reversed(recent_packets):
-                print(f"   {packet['protocol']}: {packet['source_ip']}:{packet['source_port']} → "
-                      f"{packet['destination_ip']}:{packet['destination_port']} "
-                      f"({packet['packet_size']} bytes)")
-    
-    def display_comprehensive_analysis(self):
-        """Display comprehensive analysis using all DSA components"""
-        # Protocol Analysis
-        print("\n🔍 PROTOCOL ANALYSIS (Hash Table Statistics):")
-        print("-" * 40)
-        top_protocols = self.protocol_analyzer.get_top_protocols()
-        for protocol, count in top_protocols:
-            percentage = (count / self.packet_count) * 100
-            print(f"   {protocol:8} : {count:4} packets ({percentage:5.1f}%)")
-        
-        # Source IP Analysis
-        print("\n🌐 TOP SOURCE IPs (Hash Table Analysis):")
-        print("-" * 40)
-        top_sources = self.protocol_analyzer.get_top_sources(5)
-        for ip, stats in top_sources:
-            print(f"   {ip:15} : {stats['count']:4} packets")
-        
-        # Destination IP Analysis
-        print("\n🎯 TOP DESTINATION IPs:")
-        print("-" * 40)
-        top_destinations = self.protocol_analyzer.get_top_destinations(5)
-        for ip, stats in top_destinations:
-            print(f"   {ip:15} : {stats['count']:4} packets")
-        
-        # Packet Tree Structure
-        print("\n🌳 PACKET TREE STRUCTURE (Tree Data Structure):")
-        print("-" * 40)
-        self.packet_tree.print_tree()
-        
-        # Buffer Statistics
-        print(f"\n💾 CIRCULAR BUFFER STATISTICS:")
-        print("-" * 40)
-        print(f"   Buffer usage: {len(self.packet_buffer)}/{self.packet_buffer.capacity}")
-        print(f"   Total packets processed: {self.packet_count}")
-        
-        # Performance Metrics
-        capture_duration = (datetime.now() - self.start_time).total_seconds()
-        packets_per_second = self.packet_count / capture_duration if capture_duration > 0 else 0
-        print(f"\n📈 PERFORMANCE METRICS:")
-        print("-" * 40)
-        print(f"   Capture duration: {capture_duration:.1f} seconds")
-        print(f"   Packets per second: {packets_per_second:.1f}")
-        print(f"   Memory efficiency: Excellent (fixed buffer size)")
-    
-    def search_packets(self, criteria):
-        """Search packets based on criteria (DSA: Linear Search in Buffer)"""
-        print(f"\n🔎 SEARCHING PACKETS: {criteria}")
-        print("-" * 40)
-        
-        matches = []
-        recent_packets = self.packet_buffer.get_recent(len(self.packet_buffer))
-        
-        for packet in recent_packets:
-            match = True
-            for key, value in criteria.items():
-                if key in packet and str(packet[key]) != str(value):
-                    match = False
-                    break
-            if match:
-                matches.append(packet)
-        
-        print(f"Found {len(matches)} matching packets:")
-        for i, packet in enumerate(matches[:10]):  # Show first 10 matches
-            print(f"  {i+1}. {packet['protocol']}: {packet['source_ip']} → {packet['destination_ip']}")
-        
-        if len(matches) > 10:
-            print(f"  ... and {len(matches) - 10} more")
-        
-        return matches
 
-def main():
-    """Main function to demonstrate the packet analyzer"""
-    analyzer = NetworkPacketAnalyzer(buffer_capacity=500)
-    
-    print("🚀 NETWORK PACKET ANALYZER - DSA MINI PROJECT")
-    print("=" * 60)
-    print("This simulator demonstrates:")
-    print("• Circular Buffer - For storing recent packets efficiently")
-    print("• Hash Tables - For protocol and IP statistics")
-    print("• Tree Structures - For hierarchical packet organization")
-    print("• Searching Algorithms - For packet analysis")
-    print("=" * 60)
-    
-    # Start the capture
-    analyzer.start_capture(duration=20, packet_rate=15)
-    
-    # Demonstrate search functionality
-    print("\n" + "=" * 60)
-    print("🔍 DEMONSTRATING SEARCH FUNCTIONALITY")
-    print("=" * 60)
-    
-    # Search for TCP packets
-    analyzer.search_packets({'protocol': 'TCP'})
-    
-    # Search for packets from a specific IP
-    analyzer.search_packets({'source_ip': '192.168.1.1'})
-    
-    print("\n" + "=" * 60)
-    print("✅ ANALYSIS COMPLETE!")
-    print("This project demonstrates real-world application of:")
-    print("• Circular Buffer for memory-efficient storage")
-    print("• Hash Tables for O(1) lookups and statistics")
-    print("• Tree Structures for hierarchical data organization")
-    print("• Efficient searching and traversal algorithms")
-    print("=" * 60)
+    def parse_packet(self, raw_data):
+        try:
+            ip_header = raw_data[0:20]
+            iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+            src_ip = socket.inet_ntoa(iph[8])
+            dst_ip = socket.inet_ntoa(iph[9])
+            proto_num = iph[6]
+            proto = {6:'TCP', 17:'UDP'}.get(proto_num, 'Other')
+            iph_length = (iph[0] & 0xF) * 4
+            sport = dport = "-"
+            if proto == "TCP":
+                tcp_header = raw_data[iph_length:iph_length+4]
+                tcph = struct.unpack('!HH', tcp_header)
+                sport, dport = tcph[0], tcph[1]
+            elif proto == "UDP":
+                udp_header = raw_data[iph_length:iph_length+4]
+                udph = struct.unpack('!HH', udp_header)
+                sport, dport = udph[0], udph[1]
+            return {
+                "src": src_ip, "dst": dst_ip, "proto": proto,
+                "sport": sport, "dport": dport, "raw": raw_data
+            }
+        except Exception:
+            self.error_count += 1
+            return {
+                "src": "ERR", "dst": "-", "proto": "Other",
+                "sport": "-", "dport": "-", "raw": b''
+            }
+
+    def capture_packets(self):
+        cnt = 0
+        if self.demo_mode:
+            while self.running and cnt < self.packet_limit:
+                info = self.create_fake_packet()
+                self.packet_buffer.append(info)
+                self.stats_protocol[info['proto']] = self.stats_protocol.get(info['proto'], 0) + 1
+                for port_key in ['sport','dport']:
+                    val = info[port_key]
+                    if val != "-" and isinstance(val, int):
+                        self.stats_ports[val] = self.stats_ports.get(val,0)+1
+                for ipkey in ['src','dst']:
+                    val = info[ipkey]
+                    if val != "ERR":
+                        self.stats_ips[val] = self.stats_ips.get(val,0)+1
+                if cnt % 2 == 0:
+                    self.master.after(0, self.refresh_table)
+                    self.master.after(0, self.update_stats_display)
+                    self.master.after(0, lambda v=cnt: self.progress.config(value=v))
+                cnt += 1
+                time.sleep(0.07)
+            self.running = False
+            self.status_var.set(f"Demo finished. {cnt} packets.")
+        else:
+            try:
+                sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+                sniffer.bind(('0.0.0.0', 0))
+                sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            except Exception as e:
+                self.master.after(0, lambda: self.status_var.set(f"Socket creation failed: {e}"))
+                return
+
+            while self.running and cnt < self.packet_limit:
+                try:
+                    raw_data, _ = sniffer.recvfrom(65565)
+                    info = self.parse_packet(raw_data)
+                    self.packet_buffer.append(info)
+                    proto = info['proto']
+                    self.stats_protocol[proto] = self.stats_protocol.get(proto,0)+1
+                    for port_key in ['sport','dport']:
+                        val = info[port_key]
+                        if val != "-" and isinstance(val, int):
+                            self.stats_ports[val] = self.stats_ports.get(val,0)+1
+                    for ipkey in ['src','dst']:
+                        val = info[ipkey]
+                        if val != "ERR":
+                            self.stats_ips[val] = self.stats_ips.get(val,0)+1
+                    if cnt % 2 == 0:
+                        self.master.after(0, self.refresh_table)
+                        self.master.after(0, self.update_stats_display)
+                        self.master.after(0, lambda v=cnt: self.progress.config(value=v))
+                    cnt += 1
+                    time.sleep(0.03)
+                except Exception:
+                    self.error_count += 1
+                    continue
+            self.running = False
+            self.status_var.set(f"Capture finished. {cnt} packets.")
+
+    def start_capture(self):
+        if self.running:
+            return
+        self.running = True
+        self.paused = False
+        self.packet_buffer.clear()
+        self.progress["value"] = 0
+        self.stats_protocol = {'TCP': 0, 'UDP': 0, 'Other': 0}
+        self.stats_ports = {}
+        self.stats_ips = {}
+        self.error_count = 0
+        self.start_time = time.time()
+        self.status_var.set("Capture started.")
+        self.capture_thread = threading.Thread(target=self.capture_packets, daemon=True)
+        self.capture_thread.start()
+
+    def stop_capture(self):
+        self.running = False
+        self.status_var.set(f"Capture stopped, {self.error_count} packet errors.")
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.pause_button.config(text="Resume" if self.paused else "Pause")
+        self.status_var.set("Paused." if self.paused else "Resumed.")
+
+    def clear_display(self):
+        self.packet_buffer.clear()
+        self.progress["value"] = 0
+        self.refresh_table()
+        self.status_var.set("Display cleared.")
+
+    def save_to_csv(self):
+        if len(self.packet_buffer) == 0:
+            messagebox.showinfo("No Data", "No packets to save.")
+            return
+        filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
+        if filename:
+            with open(filename, "w") as f:
+                f.write("Index,Source,SourcePort,Destination,DestinationPort,Protocol\n")
+                for idx, info in enumerate(self.packet_buffer):
+                    f.write(f"{idx+1},{info['src']},{info['sport']},{info['dst']},{info['dport']},{info['proto']}\n")
+            self.status_var.set(f"Saved packet table to {filename}")
+
+    def show_about(self):
+        messagebox.showinfo("About", "Network Packet Analyzer — Subtle Journal Edition\nClean interface, modern flat buttons, light colors, Demo Mode for instant test.\nSwitch to Live mode for real capture.")
+
+    def update_stats_display(self):
+        total = len(self.packet_buffer)
+        t = self.stats_protocol['TCP']
+        u = self.stats_protocol['UDP']
+        o = self.stats_protocol['Other']
+        self.stats_label.config(text=f"Packets: {total}  TCP: {t}  UDP: {u}  Other: {o}  Errors: {self.error_count}")
+
+        if self.stats_ips:
+            topips = sorted(self.stats_ips.items(), key=lambda kv: -kv[1])[:3]
+            topipstr = ", ".join([f"{ip}({c})" for ip,c in topips])
+        else:
+            topipstr = "-"
+        self.top_ip_label.config(text=f"Top IPs: {topipstr}")
+
+        if self.stats_ports:
+            topports = sorted(self.stats_ports.items(), key=lambda kv: -kv[1])[:3]
+            topportstr = ", ".join([f"{port}({c})" for port,c in topports])
+        else:
+            topportstr = "-"
+        self.top_port_label.config(text=f"Top Ports: {topportstr}")
+
+    def get_port_filter(self):
+        try:
+            val = self.port_filter.get().strip()
+            if val == "":
+                return None
+            num = int(val)
+            return num
+        except Exception:
+            return None
+
+    def refresh_table(self):
+        self.packet_table.delete(*self.packet_table.get_children())
+        protofilt = self.protocol_filter.get()
+        portfilt = self.get_port_filter()
+        shown = 0
+        for idx, info in enumerate(self.packet_buffer[-100:]):
+            tag = 'evenrow' if (idx % 2 == 0) else 'oddrow'
+            if protofilt != "ALL" and info['proto'] != protofilt:
+                continue
+            if portfilt and (info['sport'] != portfilt and info['dport'] != portfilt):
+                continue
+            self.packet_table.insert("", "end", values=(idx+1, info['src'], info['sport'], info['dst'], info['dport'], info['proto']), tags=(tag,))
+            shown += 1
+        self.status_var.set(f"Table refreshed. Showing {shown} packets.")
+
+    def show_packet_details(self, event):
+        sel = self.packet_table.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        vals = self.packet_table.item(iid)["values"]
+        idx = int(vals[0])-1
+        pkt = self.packet_buffer[idx]
+        msg = f"""Source IP: {pkt['src']}
+Source Port: {pkt['sport']}
+Destination IP: {pkt['dst']}
+Destination Port: {pkt['dport']}
+Protocol: {pkt['proto']}
+Raw header (first 45B):\n{pkt['raw'][:45]!r}"""
+        messagebox.showinfo(f"Packet #{vals[0]}", msg)
+
+    def update_timer(self):
+        if self.start_time and self.running:
+            elapsed = int(time.time() - self.start_time)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            self.timer_label.config(text=f"{mins:02}:{secs:02}")
+        self.master.after(1000, self.update_timer)
 
 if __name__ == "__main__":
-    main()
+    root = tb.Window(themename="journal")  # "journal" = minimal flat, "pulse" and "morph" also good
+    app = PacketAnalyzerGUI(root)
+    root.mainloop()
